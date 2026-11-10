@@ -20,7 +20,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
     env:
       GH_TOKEN: ${{ github.token }}
     outputs:
@@ -61,24 +61,35 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
-      # The same files for download.easydiffraction.org, whose host pulls this branch through a webhook. Each
-      # update is one commit on top of the last, so git sends only what changed.
-      - name: Update the deploy branch
+      - name: Mint a token for edi-sites
+        id: sites-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.ENHANTICA_APP_ID }}
+          private-key: ${{ secrets.ENHANTICA_APP_KEY }}
+          owner: enhantica
+          repositories: edi-sites
+      # The same files for download.easydiffraction.org, whose host pulls this branch of edi-sites through a
+      # webhook. Each update is one commit on top of the last, so git sends only what changed.
+      - name: Update the deploy-download branch
+        env:
+          SITES_TOKEN: ${{ steps.sites-token.outputs.token }}
         run: |
+          remote="https://x-access-token:${SITES_TOKEN}@github.com/enhantica/edi-sites.git"
           work=$(mktemp -d)
-          if git fetch --depth 1 origin refs/heads/deploy 2>/dev/null; then
-            git worktree add --detach "$work" FETCH_HEAD
+          git -C "$work" init -q
+          if git -C "$work" fetch -q --depth 1 "$remote" refs/heads/deploy-download 2>/dev/null; then
+            git -C "$work" checkout -q --detach FETCH_HEAD
           else
-            git worktree add --detach "$work" HEAD
-            (cd "$work" && git checkout -q --orphan deploy && git rm -rqf --ignore-unmatch .)
+            git -C "$work" checkout -q --orphan deploy-download
           fi
           rsync -a --delete --exclude .git site/ "$work"/
           cd "$work"
           git add -A
-          if git diff --cached --quiet; then echo "deploy is up to date"; exit 0; fi
+          if git rev-parse -q --verify HEAD >/dev/null && git diff --cached --quiet; then echo "up to date"; exit 0; fi
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
             commit -q -m "Update the downloads"
-          git push -q origin HEAD:refs/heads/deploy
+          git push -q "$remote" HEAD:refs/heads/deploy-download
 
   deploy:
     needs: build
