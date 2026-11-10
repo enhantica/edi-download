@@ -19,6 +19,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
     outputs:
@@ -59,6 +61,24 @@ jobs:
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
+      # The same files for download.easydiffraction.org, whose host pulls this branch through a webhook. Each
+      # update is one commit on top of the last, so git sends only what changed.
+      - name: Update the deploy branch
+        run: |
+          work=$(mktemp -d)
+          if git fetch --depth 1 origin refs/heads/deploy 2>/dev/null; then
+            git worktree add --detach "$work" FETCH_HEAD
+          else
+            git worktree add --detach "$work" HEAD
+            (cd "$work" && git checkout -q --orphan deploy && git rm -rqf --ignore-unmatch .)
+          fi
+          rsync -a --delete --exclude .git site/ "$work"/
+          cd "$work"
+          git add -A
+          if git diff --cached --quiet; then echo "deploy is up to date"; exit 0; fi
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -q -m "Update the downloads"
+          git push -q origin HEAD:refs/heads/deploy
 
   deploy:
     needs: build
