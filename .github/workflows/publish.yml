@@ -1,0 +1,74 @@
+name: Publish downloads
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: edi release tag to publish, for example v2026.11.0 (empty for the latest)
+        type: string
+  schedule:
+    - cron: '17 4 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Choose the release
+        id: tag
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if [ -z "$TAG" ]; then
+            TAG=$(gh release view --repo enhantica/edi --json tagName --jq .tagName)
+          fi
+          gh release view "$TAG" --repo enhantica/edi --json isDraft --jq 'if .isDraft then error("draft") else . end' >/dev/null
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v5
+        with:
+          repository: enhantica/edi
+          ref: ${{ steps.tag.outputs.tag }}
+          path: edi
+          sparse-checkout: |
+            tools/release
+            website
+            data
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - name: Download the release's repositories, feed and index inputs
+        run: |
+          gh release download "${{ steps.tag.outputs.tag }}" --repo enhantica/edi --dir assets \
+            --pattern 'repository-stable-*.tar.gz' --pattern 'release.json' --pattern 'release-history.json' \
+            --pattern 'SHA256SUMS'
+          # The archives must be the bytes the release recorded.
+          (cd assets && grep -E ' (repository-stable-.*\.tar\.gz|release\.json|release-history\.json)$' SHA256SUMS | sha256sum --check)
+      - name: Build the site
+        run: python build_site.py --edi edi --assets assets --output site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
