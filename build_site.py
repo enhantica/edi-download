@@ -36,8 +36,16 @@ def main() -> None:
     for archive in archives:
         with tarfile.open(archive) as opened:
             opened.extractall(site, filter='data')
-    (site / 'releases').mkdir()
-    shutil.copy2(args.assets / 'release-history.json', site / 'releases/stable.json')
+    # From 26.17 apps read stable-v2.json, and stable.json is the checked feed for 2026.11.x apps,
+    # which drop a whole feed over one YY.N version (edi ADR-0106). write_feeds refuses a feed they
+    # would drop, so the build fails and the site in place stays. Older tags copy the history.
+    if (edi / 'tools/release/legacy_feed.py').is_file():
+        from legacy_feed import write_feeds  # noqa: PLC0415
+
+        write_feeds(args.assets / 'release-history.json', site / 'releases')
+    else:
+        (site / 'releases').mkdir()
+        shutil.copy2(args.assets / 'release-history.json', site / 'releases/stable.json')
     # The current wheels are served beside the index, older ones link their GitHub releases.
     pages = json.loads(
         subprocess.check_output(
