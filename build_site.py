@@ -1,17 +1,29 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Build the download site from one published edi release and edi's own release tools.
 
-Run as ``python build_site.py --edi edi --assets assets --output site``: ``edi`` is edi checked
-out at the release tag and ``assets`` that release's downloaded assets.
+Run as ``python build_site.py --edi edi --assets assets --output site --pages pages
+--previous current``: ``edi`` is edi checked out at the release tag, ``assets`` that release's
+downloaded assets, ``site`` the tree for download.easydiffraction.org, ``pages`` the copy for
+GitHub Pages and ``current`` the tree the download host serves now.
+
+A release attaches its component repositories in full (``repository-stable-<platform>.tar.gz``)
+or as an index (``repoindex-stable-<platform>.tar.gz``): Updates.xml, the meta.7z and .sha1 files,
+and the rules that send each archive to the release asset holding it (redirects.py). An index
+release keeps the previous release's .sha1 and meta.7z files from ``current``. Pages cannot
+redirect, so its copy of an index release has no repository/.
 """
 
 import argparse
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
 import tarfile
 from pathlib import Path
+
+from redirects import RULE_FILE, archive_redirects, listed_archives, parse_rules
 
 
 def main() -> None:
@@ -19,6 +31,8 @@ def main() -> None:
     parser.add_argument('--edi', required=True, type=Path)
     parser.add_argument('--assets', required=True, type=Path)
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--pages', type=Path)
+    parser.add_argument('--previous', type=Path)
     args = parser.parse_args()
     edi = args.edi.resolve()
     sys.path[:0] = [str(edi / 'tools/release'), str(edi / 'website')]
@@ -29,13 +43,7 @@ def main() -> None:
     site = args.output
     shutil.rmtree(site, ignore_errors=True)
     site.mkdir(parents=True)
-    # Each archive holds repository/<platform>/ at the path the installers read.
-    archives = sorted(args.assets.glob('repository-stable-*.tar.gz'))
-    if len(archives) != 3:
-        raise SystemExit(f'Expected three stable component repositories, found {len(archives)}')
-    for archive in archives:
-        with tarfile.open(archive) as opened:
-            opened.extractall(site, filter='data')
+    redirected = write_repositories(args.assets, site, args.previous, release['version'])
     # From 26.17 apps read stable-v2.json, and stable.json is the checked feed for 2026.11.x apps,
     # which drop a whole feed over one YY.N version (edi ADR-0106). write_feeds refuses a feed they
     # would drop, so the build fails and the site in place stays. Older tags copy the history.
@@ -56,17 +64,98 @@ def main() -> None:
     wheels = sorted(p.name for p in (site / 'pypi/simple/easydiffraction').glob('*.whl'))
     if not wheels or any(release['version'] not in name for name in wheels):
         raise SystemExit(f'The index does not serve the {release["version"]} wheels: {wheels}')
-    (site / 'SHA256SUMS').write_text(manifest(site), encoding='utf-8')
-    (site / '.nojekyll').write_text('')
-    (site / 'index.html').write_text(
-        '<!doctype html>\n<html><body>\n'
-        f'<p>EasyDiffraction {release["version"]} downloads: '
-        '<a href="https://github.com/enhantica/edi/releases">GitHub Releases</a>, '
-        '<a href="pypi/simple/">Python package index</a>.</p>\n'
-        '</body></html>\n',
-        encoding='utf-8',
-    )
-    print(f'site for {release["version"]}: {len(wheels)} wheels, {len(archives)} repositories')
+    trees = [site]
+    if args.pages:
+        # Without the archives Pages would list components it cannot serve, so it carries no
+        # repository at all and the installers skip it for the download host.
+        shutil.rmtree(args.pages, ignore_errors=True)
+        skip = None if redirected is None else shutil.ignore_patterns('repository', '.htaccess')
+        shutil.copytree(site, args.pages, ignore=skip, copy_function=os.link)
+        trees.append(args.pages)
+    for tree in trees:
+        (tree / 'SHA256SUMS').write_text(manifest(tree), encoding='utf-8')
+        (tree / '.nojekyll').write_text('')
+        (tree / 'index.html').write_text(
+            '<!doctype html>\n<html><body>\n'
+            f'<p>EasyDiffraction {release["version"]} downloads: '
+            '<a href="https://github.com/enhantica/edi/releases">GitHub Releases</a>, '
+            '<a href="pypi/simple/">Python package index</a>.</p>\n'
+            '</body></html>\n',
+            encoding='utf-8',
+        )
+    redirects = '' if redirected is None else f', {redirected} archives on the release'
+    print(f'site for {release["version"]}: {len(wheels)} wheels, 3 repositories{redirects}')
+
+
+def write_repositories(
+    assets: Path, site: Path, previous: Path | None, version: str
+) -> int | None:
+    """Write the component repositories; for an index, return how many archives redirect."""
+    # Each archive holds repository/<platform>/ at the path the installers read.
+    full = sorted(assets.glob('repository-stable-*.tar.gz'))
+    index = sorted(assets.glob('repoindex-stable-*.tar.gz'))
+    if full and index:
+        raise SystemExit('The release carries both full and index component repositories')
+    archives = full or index
+    if len(archives) != 3:
+        raise SystemExit(f'Expected three stable component repositories, found {len(archives)}')
+    for archive in archives:
+        with tarfile.open(archive) as opened:
+            if index:
+                check_index(opened.getnames(), archive.name)
+            opened.extractall(site, filter='data')
+    if not index:
+        # An index under the full name would leave every archive missing on the host.
+        missing = [path for path in listed_archives(site) if not (site / path).is_file()]
+        if missing:
+            raise SystemExit(f'The repositories lack archives they list: {", ".join(missing[:3])}')
+        return None
+    install_redirects(site)
+    if previous:
+        keep_previous(previous, site, version)
+    return len(archive_redirects(site))
+
+
+def check_index(names: list[str], archive: str) -> None:
+    """Refuse an index archive that holds component archives or no redirect rules."""
+    stray = [name for name in names if name.endswith('.7z') and not name.endswith('meta.7z')]
+    if stray:
+        raise SystemExit(f'{archive} holds component archives: {", ".join(stray[:3])}')
+    if not any(name.endswith(f'/{RULE_FILE}') for name in names):
+        raise SystemExit(f'{archive} has no {RULE_FILE}')
+
+
+def install_redirects(site: Path) -> None:
+    """Move each platform's redirect rules into the site's .htaccess, which only the host reads."""
+    parts = ['RewriteEngine On\n']
+    for rules in sorted((site / 'repository').rglob(RULE_FILE)):
+        where = rules.relative_to(site).as_posix()
+        text = rules.read_text(encoding='utf-8')
+        parse_rules(text, where)
+        parts.append(f'# {where}\n{text.strip()}\n')
+        rules.unlink()
+    (site / '.htaccess').write_text(''.join(parts), encoding='utf-8')
+
+
+def keep_previous(current: Path, site: Path, version: str) -> None:
+    """Keep the previous release's .sha1 and meta.7z files from the tree the host serves now.
+
+    An update that read the previous Updates.xml still asks for them; its archives redirect like
+    any other. Only the newest older version is kept, so the files of one release ride along.
+    """
+    from versions import PATTERN, version_key  # noqa: PLC0415
+
+    small = re.compile(rf'({PATTERN})(?:[A-Za-z][A-Za-z0-9._-]*\.sha1|meta\.7z)')
+    found: dict[str, list[Path]] = {}
+    for path in sorted((current / 'repository').rglob('*')):
+        if path.is_file() and (match := small.fullmatch(path.name)):
+            found.setdefault(match[1], []).append(path)
+    older = [v for v in found if version_key(v) < version_key(version)]
+    for path in found[max(older, key=version_key)] if older else []:
+        kept = site / path.relative_to(current)
+        if not kept.exists():
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, kept)
 
 
 if __name__ == '__main__':
