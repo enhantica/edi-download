@@ -120,6 +120,7 @@ jobs:
       # The same files for download.easydiffraction.org, whose host pulls this branch of edi-sites through a
       # webhook. Each update is one commit on top of the last, so git sends only what changed.
       - name: Update the deploy-download branch
+        id: push
         env:
           SITES_TOKEN: ${{ steps.sites-token.outputs.token }}
         run: |
@@ -132,11 +133,25 @@ jobs:
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
             commit -q -m "Update the downloads"
           git push -q "$remote" HEAD:refs/heads/deploy-download
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
       # The host pulls on a webhook, so give it a few minutes, then expect one archive's redirect
       # and the new .sha1 beside it.
       - name: Read the download host back
         if: steps.tag.outputs.format == 'index'
         run: python redirects.py readback site --host https://download.easydiffraction.org/
+      # A host that does not serve what was pushed sends every update to a missing archive, so put
+      # the previous tree back. Its archives are already in edi-sites, so nothing large is pushed.
+      - name: Restore the previous downloads
+        if: failure() && steps.push.outputs.pushed == 'true'
+        env:
+          SITES_TOKEN: ${{ steps.sites-token.outputs.token }}
+        run: |
+          remote="https://x-access-token:${SITES_TOKEN}@github.com/enhantica/edi-sites.git"
+          cd "$RUNNER_TEMP/deploy-download"
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            revert --no-edit HEAD
+          git push -q "$remote" HEAD:refs/heads/deploy-download
+          echo "::error::The download host did not serve the new site; deploy-download is back at the previous one"
 
   deploy:
     needs: build
