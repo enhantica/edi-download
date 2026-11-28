@@ -164,17 +164,19 @@ def install_redirects(site: Path) -> None:
 
 
 def keep_previous(current: Path, site: Path, version: str) -> None:
-    """Keep the previous release's .sha1 and meta.7z files from the tree the host serves now.
+    """Keep the previous release's files from the tree the host serves now.
 
-    An update that read the previous Updates.xml still asks for them; its archives redirect like
-    any other. Only the newest older version is kept, so the files of one release ride along.
+    An update that read the previous Updates.xml still asks for its .sha1 and meta.7z files. Its
+    archives redirect like any other, except after a full release: those are not on the release,
+    so the ones the host holds are kept too. They are in edi-sites already. Only the newest older
+    version is kept, so the files of one release ride along.
     """
     from versions import PATTERN, version_key  # noqa: PLC0415
 
-    small = re.compile(rf'({PATTERN})(?:[A-Za-z][A-Za-z0-9._-]*\.sha1|meta\.7z)')
+    previous = re.compile(rf'({PATTERN})[A-Za-z][A-Za-z0-9._-]*\.(?:7z|sha1)')
     found: dict[str, list[Path]] = {}
     for path in sorted((current / 'repository').rglob('*')):
-        if path.is_file() and (match := small.fullmatch(path.name)):
+        if path.is_file() and (match := previous.fullmatch(path.name)):
             found.setdefault(match[1], []).append(path)
     older = [v for v in found if version_key(v) < version_key(version)]
     for path in found[max(older, key=version_key)] if older else []:
