@@ -21,7 +21,10 @@ from typing import override
 
 RULE_FILE = 'redirect.htaccess'
 RELEASES = 'https://github.com/enhantica/edi/releases/download/'
-ASSET = re.compile(re.escape(RELEASES) + r'[^/]+/[A-Za-z0-9._-]+')
+# A release asset's URL: its tag, then its name, neither of them . or .. that could leave edi.
+ASSET = re.compile(re.escape(RELEASES) + r'v[A-Za-z0-9._-]+/(?!\.\.?$)[A-Za-z0-9._-]+')
+# A rule's target, the same with the $N of its matches in place.
+TARGET = re.compile(re.escape(RELEASES) + r'v[A-Za-z0-9._$-]+/(?!\.\.?$)[A-Za-z0-9._$-]+')
 NOT_A_FILE = ['RewriteCond', '%{REQUEST_FILENAME}', '!-f']
 FLAGS = ('[R=302,L]', '[L,R=302]')
 HEADERS = {'User-Agent': 'edi-download'}
@@ -58,10 +61,8 @@ def parse_rules(text: str, where: str) -> Rules:
 
 
 def _rule(pattern: str, url: str, flags: str) -> tuple[re.Pattern, str] | None:
-    """A redirect of paths under repository/ to edi's releases, or None."""
-    if not pattern.startswith('^repository/') or not url.startswith(RELEASES):
-        return None
-    if flags not in FLAGS or re.search(r'[%\\{}]', url):
+    """A redirect of paths under repository/ to an asset of edi's releases, or None."""
+    if not pattern.startswith('^repository/') or not TARGET.fullmatch(url) or flags not in FLAGS:
         return None
     try:
         compiled = re.compile(pattern)
