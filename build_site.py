@@ -101,8 +101,7 @@ def write_repositories(
         raise SystemExit(f'Expected three stable component repositories, found {len(archives)}')
     for archive in archives:
         with tarfile.open(archive) as opened:
-            if index:
-                check_index(opened.getnames(), archive.name)
+            check_members(opened.getmembers(), archive.name, index=bool(index))
             opened.extractall(site, filter='data')
     if not index:
         # An index under the full name would leave every archive missing on the host.
@@ -116,12 +115,39 @@ def write_repositories(
     return len(archive_redirects(site))
 
 
-def check_index(names: list[str], archive: str) -> None:
-    """Refuse an index archive that holds component archives or no redirect rules."""
-    stray = [name for name in names if name.endswith('.7z') and not name.endswith('meta.7z')]
+# The parts of a component repository's paths, as edi's repogen writes them.
+PLATFORM = r'[a-z0-9]+(?:[-_][a-z0-9]+)*'
+COMPONENT = r'[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*'
+VERSION = r'[0-9]+(?:\.[0-9]+)+'
+ARCHIVE = r'[A-Za-z][A-Za-z0-9._-]*\.7z'
+
+
+def check_members(members: list[tarfile.TarInfo], archive: str, *, index: bool) -> None:
+    """Refuse a repository archive holding anything but its platform's repository files.
+
+    The host serves every file in it, so anything else, another .htaccess above all, would go out
+    unchecked. An index holds no component archives and must hold its redirect rules.
+    """
+    platform = archive.removesuffix('.tar.gz').split('-stable-', 1)[-1]
+    if not re.fullmatch(PLATFORM, platform):
+        raise SystemExit(f'{archive}: not a platform repository')
+    where = f'repository/{platform}'
+    # An index serves only meta.7z itself; the other archives stay on the release.
+    seven = r'meta\.7z' if index else ARCHIVE
+    folder = re.compile(rf'repository(?:/{platform}(?:/{COMPONENT})?)?')
+    file = re.compile(
+        rf'{where}/(?:Updates\.xml|{COMPONENT}/{VERSION}(?:{seven}|{ARCHIVE}\.sha1))'
+    )
+    allowed = {f'{where}/{RULE_FILE}'} if index else set()
+    stray = [
+        member.name
+        for member in members
+        if not (member.isdir() and folder.fullmatch(member.name.rstrip('/')))
+        and not (member.isfile() and (file.fullmatch(member.name) or member.name in allowed))
+    ]
     if stray:
-        raise SystemExit(f'{archive} holds component archives: {", ".join(stray[:3])}')
-    if not any(name.endswith(f'/{RULE_FILE}') for name in names):
+        raise SystemExit(f'{archive} holds what the site must not serve: {", ".join(stray[:3])}')
+    if index and not any(member.name in allowed for member in members):
         raise SystemExit(f'{archive} has no {RULE_FILE}')
 
 
