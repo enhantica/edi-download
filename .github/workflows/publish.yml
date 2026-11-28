@@ -6,6 +6,13 @@ on:
       tag:
         description: edi release tag to publish, for example v2026.11.0 (empty for the latest)
         type: string
+      format:
+        description: >-
+          Component repositories to serve: the index when the release has one, or the full ones,
+          to roll back with a release whose archives are all under 100 MiB
+        type: choice
+        options: [auto, full]
+        default: auto
   schedule:
     - cron: '17 4 * * *'
 
@@ -31,12 +38,30 @@ jobs:
         id: tag
         env:
           TAG: ${{ inputs.tag }}
+          FORMAT: ${{ inputs.format }}
         run: |
           if [ -z "$TAG" ]; then
             TAG=$(gh release view --repo enhantica/edi --json tagName --jq .tagName)
           fi
           gh release view "$TAG" --repo enhantica/edi --json isDraft --jq 'if .isDraft then error("draft") else . end' >/dev/null
+          # The component repositories come in full, or as an index whose archives stay on the
+          # release and are reached through the download host's redirects. A release with an index
+          # still attaches the full ones, which are served only when asked for (format: full).
+          names=$(gh release view "$TAG" --repo enhantica/edi --json assets --jq '.assets[].name')
+          full=$(grep -c '^repository-stable-.*\.tar\.gz$' <<< "$names" || true)
+          index=$(grep -c '^repoindex-stable-.*\.tar\.gz$' <<< "$names" || true)
+          if [ "$FORMAT" = full ]; then
+            if [ "$full" -eq 0 ]; then echo "::error::$TAG carries no full component repositories"; exit 1; fi
+            format=full
+          elif [ "$index" -gt 0 ]; then
+            format=index
+          elif [ "$full" -gt 0 ]; then
+            format=full
+          else
+            echo "::error::$TAG carries no component repositories"; exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "format=$format" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v5
         with:
           repository: enhantica/edi
@@ -50,17 +75,14 @@ jobs:
         with:
           python-version: '3.14'
       - name: Download the release's repositories, feed and index inputs
+        env:
+          REPOSITORIES: ${{ steps.tag.outputs.format == 'index' && 'repoindex-stable' || 'repository-stable' }}
         run: |
           gh release download "${{ steps.tag.outputs.tag }}" --repo enhantica/edi --dir assets \
-            --pattern 'repository-stable-*.tar.gz' --pattern 'release.json' --pattern 'release-history.json' \
+            --pattern "$REPOSITORIES-*.tar.gz" --pattern 'release.json' --pattern 'release-history.json' \
             --pattern 'SHA256SUMS'
           # The archives must be the bytes the release recorded.
-          (cd assets && grep -E ' (repository-stable-.*\.tar\.gz|release\.json|release-history\.json)$' SHA256SUMS | sha256sum --check)
-      - name: Build the site
-        run: python build_site.py --edi edi --assets assets --output site
-      - uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
+          (cd assets && grep -E " ($REPOSITORIES-.*\.tar\.gz|release\.json|release-history\.json)$" SHA256SUMS | sha256sum --check)
       - name: Mint a token for edi-sites
         id: sites-token
         uses: actions/create-github-app-token@v2
@@ -69,20 +91,41 @@ jobs:
           private-key: ${{ secrets.ENHANTICA_APP_KEY }}
           owner: enhantica
           repositories: edi-sites
-      # The same files for download.easydiffraction.org, whose host pulls this branch of edi-sites through a
-      # webhook. Each update is one commit on top of the last, so git sends only what changed.
-      - name: Update the deploy-download branch
+      # What download.easydiffraction.org serves now: an index release keeps the previous release's
+      # .sha1 and meta.7z files from it, for updates still in progress.
+      - name: Fetch the deploy-download branch
         env:
           SITES_TOKEN: ${{ steps.sites-token.outputs.token }}
         run: |
           remote="https://x-access-token:${SITES_TOKEN}@github.com/enhantica/edi-sites.git"
-          work=$(mktemp -d)
-          git -C "$work" init -q
+          work="$RUNNER_TEMP/deploy-download"
+          git init -q "$work"
           if git -C "$work" fetch -q --depth 1 "$remote" refs/heads/deploy-download 2>/dev/null; then
             git -C "$work" checkout -q --detach FETCH_HEAD
           else
             git -C "$work" checkout -q --orphan deploy-download
           fi
+      - name: Build the site
+        run: >-
+          python build_site.py --edi edi --assets assets --output site --pages pages
+          --previous "$RUNNER_TEMP/deploy-download"
+      # Every archive the host will redirect must already be on its release, as an anonymous
+      # installer asks for it.
+      - name: Check the archive redirects
+        if: steps.tag.outputs.format == 'index'
+        run: python redirects.py check site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: pages
+      # The same files for download.easydiffraction.org, whose host pulls this branch of edi-sites through a
+      # webhook. Each update is one commit on top of the last, so git sends only what changed.
+      - name: Update the deploy-download branch
+        id: push
+        env:
+          SITES_TOKEN: ${{ steps.sites-token.outputs.token }}
+        run: |
+          remote="https://x-access-token:${SITES_TOKEN}@github.com/enhantica/edi-sites.git"
+          work="$RUNNER_TEMP/deploy-download"
           rsync -a --delete --exclude .git site/ "$work"/
           cd "$work"
           git add -A
@@ -90,6 +133,25 @@ jobs:
           git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
             commit -q -m "Update the downloads"
           git push -q "$remote" HEAD:refs/heads/deploy-download
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+      # The host pulls on a webhook, so give it a few minutes, then expect one archive's redirect
+      # and the new .sha1 beside it.
+      - name: Read the download host back
+        if: steps.tag.outputs.format == 'index'
+        run: python redirects.py readback site --host https://download.easydiffraction.org/
+      # A host that does not serve what was pushed sends every update to a missing archive, so put
+      # the previous tree back. Its archives are already in edi-sites, so nothing large is pushed.
+      - name: Restore the previous downloads
+        if: failure() && steps.push.outputs.pushed == 'true'
+        env:
+          SITES_TOKEN: ${{ steps.sites-token.outputs.token }}
+        run: |
+          remote="https://x-access-token:${SITES_TOKEN}@github.com/enhantica/edi-sites.git"
+          cd "$RUNNER_TEMP/deploy-download"
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            revert --no-edit HEAD
+          git push -q "$remote" HEAD:refs/heads/deploy-download
+          echo "::error::The download host did not serve the new site; deploy-download is back at the previous one"
 
   deploy:
     needs: build
