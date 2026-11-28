@@ -6,11 +6,12 @@ Run as ``python build_site.py --edi edi --assets assets --output site --pages pa
 downloaded assets, ``site`` the tree for download.easydiffraction.org, ``pages`` the copy for
 GitHub Pages and ``current`` the tree the download host serves now.
 
-A release attaches its component repositories in full (``repository-stable-<platform>.tar.gz``)
-or as an index (``repoindex-stable-<platform>.tar.gz``): Updates.xml, the meta.7z and .sha1 files,
-and the rules that send each archive to the release asset holding it (redirects.py). An index
-release keeps the previous release's .sha1 and meta.7z files from ``current``. Pages cannot
-redirect, so its copy of an index release has no repository/.
+A release attaches its component repositories in full (``repository-stable-<platform>.tar.gz``),
+and newer releases also as an index (``repoindex-stable-<platform>.tar.gz``): Updates.xml, the
+meta.7z and .sha1 files, and the rules that send each archive to the release asset holding it
+(redirects.py). The index is used whenever ``assets`` holds one. An index release keeps the
+previous release's files from ``current``, for updates in progress. Pages cannot redirect, so its
+copy of an index release has no repository/.
 """
 
 import argparse
@@ -91,12 +92,11 @@ def write_repositories(
     assets: Path, site: Path, previous: Path | None, version: str
 ) -> int | None:
     """Write the component repositories; for an index, return how many archives redirect."""
-    # Each archive holds repository/<platform>/ at the path the installers read.
+    # Each archive holds repository/<platform>/ at the path the installers read. A release with
+    # an index still attaches the full repositories, for a rollback (publish.yml's format input).
     full = sorted(assets.glob('repository-stable-*.tar.gz'))
     index = sorted(assets.glob('repoindex-stable-*.tar.gz'))
-    if full and index:
-        raise SystemExit('The release carries both full and index component repositories')
-    archives = full or index
+    archives = index or full
     if len(archives) != 3:
         raise SystemExit(f'Expected three stable component repositories, found {len(archives)}')
     for archive in archives:

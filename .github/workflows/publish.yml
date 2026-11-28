@@ -6,6 +6,13 @@ on:
       tag:
         description: edi release tag to publish, for example v2026.11.0 (empty for the latest)
         type: string
+      format:
+        description: >-
+          Component repositories to serve: the index when the release has one, or the full ones,
+          to roll back with a release whose archives are all under 100 MiB
+        type: choice
+        options: [auto, full]
+        default: auto
   schedule:
     - cron: '17 4 * * *'
 
@@ -31,22 +38,25 @@ jobs:
         id: tag
         env:
           TAG: ${{ inputs.tag }}
+          FORMAT: ${{ inputs.format }}
         run: |
           if [ -z "$TAG" ]; then
             TAG=$(gh release view --repo enhantica/edi --json tagName --jq .tagName)
           fi
           gh release view "$TAG" --repo enhantica/edi --json isDraft --jq 'if .isDraft then error("draft") else . end' >/dev/null
           # The component repositories come in full, or as an index whose archives stay on the
-          # release and are reached through the download host's redirects. Never both or neither.
+          # release and are reached through the download host's redirects. A release with an index
+          # still attaches the full ones, which are served only when asked for (format: full).
           names=$(gh release view "$TAG" --repo enhantica/edi --json assets --jq '.assets[].name')
           full=$(grep -c '^repository-stable-.*\.tar\.gz$' <<< "$names" || true)
           index=$(grep -c '^repoindex-stable-.*\.tar\.gz$' <<< "$names" || true)
-          if [ "$full" -gt 0 ] && [ "$index" -gt 0 ]; then
-            echo "::error::$TAG carries both full and index component repositories"; exit 1
-          elif [ "$full" -gt 0 ]; then
+          if [ "$FORMAT" = full ]; then
+            if [ "$full" -eq 0 ]; then echo "::error::$TAG carries no full component repositories"; exit 1; fi
             format=full
           elif [ "$index" -gt 0 ]; then
             format=index
+          elif [ "$full" -gt 0 ]; then
+            format=full
           else
             echo "::error::$TAG carries no component repositories"; exit 1
           fi
